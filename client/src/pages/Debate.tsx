@@ -309,6 +309,8 @@ export default function Debate() {
         mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
             audioChunksRef.current.push(event.data);
+            // Process the chunk immediately when data is available
+            processAudioChunk();
           }
         };
         
@@ -316,16 +318,6 @@ export default function Debate() {
         mediaRecorder.start(5000);
         setIsRecording(true);
         setIsMicActive(true);
-        
-        // Set up interval to process chunks
-        const transcriptionInterval = setInterval(() => {
-          if (audioChunksRef.current.length > 0) {
-            processAudioChunk();
-          }
-        }, 5000);
-        
-        // Store interval for cleanup
-        (mediaRecorder as any)._transcriptionInterval = transcriptionInterval;
         
         toast.success("Recording started");
         speakAnnouncement("Your time begins now.");
@@ -348,11 +340,6 @@ export default function Debate() {
     
     // Stop recording and process final chunk
     if (mediaRecorderRef.current && isRecording) {
-      // Clear transcription interval
-      if ((mediaRecorderRef.current as any)._transcriptionInterval) {
-        clearInterval((mediaRecorderRef.current as any)._transcriptionInterval);
-      }
-      
       mediaRecorderRef.current.stop();
       
       // Process any remaining audio
