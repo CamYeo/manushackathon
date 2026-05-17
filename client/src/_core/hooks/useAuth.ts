@@ -9,7 +9,9 @@ type UseAuthOptions = {
 };
 
 export function useAuth(options?: UseAuthOptions) {
-  const { redirectOnUnauthenticated = false, redirectPath = getLoginUrl() } =
+  // getLoginUrl() returns null when Manus OAuth env vars are missing (local dev).
+  // Fall back to "/" so we never pass an invalid URL to window.location.href.
+  const { redirectOnUnauthenticated = false, redirectPath = getLoginUrl() ?? "/" } =
     options ?? {};
   const utils = trpc.useUtils();
 

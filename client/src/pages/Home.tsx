@@ -1,7 +1,8 @@
 import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
-import { getLoginUrl } from "@/const";
+import { getLoginUrl, isOAuthConfigured } from "@/const";
 import { ArrowRight, Mic, Brain, Users, Clock, BarChart3, Zap } from "lucide-react";
+import { Fragment } from "react";
 import { Link } from "wouter";
 
 export default function Home() {
@@ -32,13 +33,21 @@ export default function Home() {
                   </Button>
                 </Link>
               </>
-            ) : (
-              <a href={getLoginUrl()}>
+            ) : isOAuthConfigured ? (
+              <a href={getLoginUrl()!}>
                 <Button className="brutalist-border brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-6 py-3 h-auto">
                   Sign In
                   <ArrowRight className="ml-2 h-5 w-5" />
                 </Button>
               </a>
+            ) : (
+              /* Local dev: no Manus OAuth, go straight to lobby as dev user */
+              <Link href="/lobby">
+                <Button className="brutalist-border brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-6 py-3 h-auto">
+                  Enter (Dev Mode)
+                  <ArrowRight className="ml-2 h-5 w-5" />
+                </Button>
+              </Link>
             )}
           </div>
         </div>
@@ -47,13 +56,13 @@ export default function Home() {
       {/* Hero Section */}
       <section className="pt-32 pb-20 md:pt-40 md:pb-32">
         <div className="container">
-          <div className="grid lg:grid-cols-2 gap-12 items-end">
-            <div className="space-y-8">
+          <div className="grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)] gap-12 lg:gap-16 items-end">
+            <div className="space-y-8 min-w-0">
               <div className="space-y-4">
                 <p className="text-lg md:text-xl font-bold uppercase tracking-widest text-muted-foreground">
                   AI-Powered Training
                 </p>
-                <h1 className="text-massive leading-none">
+                <h1 className="text-massive leading-none break-words">
                   DEBATE<br />
                   <span className="brutalist-underline">SMARTER</span>
                 </h1>
@@ -70,13 +79,20 @@ export default function Home() {
                       <ArrowRight className="ml-3 h-6 w-6" />
                     </Button>
                   </Link>
-                ) : (
-                  <a href={getLoginUrl()}>
+                ) : isOAuthConfigured ? (
+                  <a href={getLoginUrl()!}>
                     <Button size="lg" className="brutalist-border brutalist-shadow-lg brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-8 py-6 h-auto text-lg">
                       Get Started
                       <ArrowRight className="ml-3 h-6 w-6" />
                     </Button>
                   </a>
+                ) : (
+                  <Link href="/lobby">
+                    <Button size="lg" className="brutalist-border brutalist-shadow-lg brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-8 py-6 h-auto text-lg">
+                      Get Started (Dev)
+                      <ArrowRight className="ml-3 h-6 w-6" />
+                    </Button>
+                  </Link>
                 )}
                 <Link href="/lobby">
                   <Button variant="outline" size="lg" className="brutalist-border bg-transparent uppercase font-black tracking-wider px-8 py-6 h-auto text-lg hover:bg-foreground hover:text-background transition-colors">
@@ -85,25 +101,25 @@ export default function Home() {
                 </Link>
               </div>
             </div>
-            <div className="hidden lg:block">
-              <div className="brutalist-border-thick brutalist-shadow-lg p-8 bg-background">
-                <div className="space-y-4">
+            <div className="hidden lg:block min-w-0 w-full lg:max-w-2xl xl:max-w-3xl justify-self-end">
+              <div className="brutalist-border-thick brutalist-shadow-lg p-8 lg:p-10 xl:p-12 bg-background">
+                <div className="space-y-4 lg:space-y-6">
                   <div className="flex items-center gap-4">
-                    <div className="w-4 h-4 bg-foreground"></div>
-                    <span className="font-bold uppercase tracking-wider">Asian Parliamentary Format</span>
+                    <div className="w-4 h-4 lg:w-5 lg:h-5 bg-foreground"></div>
+                    <span className="font-bold uppercase tracking-wider lg:text-lg xl:text-xl">Asian Parliamentary Format</span>
                   </div>
-                  <div className="grid grid-cols-2 gap-4 pt-4">
-                    <div className="brutalist-border p-4 team-gov">
-                      <p className="font-black uppercase text-sm mb-2">Government</p>
-                      <div className="space-y-1 text-sm">
+                  <div className="grid grid-cols-2 gap-4 lg:gap-6 pt-4">
+                    <div className="brutalist-border p-4 lg:p-6 team-gov">
+                      <p className="font-black uppercase text-sm lg:text-base xl:text-lg mb-2">Government</p>
+                      <div className="space-y-1 text-sm lg:text-base">
                         <p>• Prime Minister</p>
                         <p>• Deputy PM</p>
                         <p>• Gov. Whip</p>
                       </div>
                     </div>
-                    <div className="brutalist-border p-4 team-opp">
-                      <p className="font-black uppercase text-sm mb-2">Opposition</p>
-                      <div className="space-y-1 text-sm">
+                    <div className="brutalist-border p-4 lg:p-6 team-opp">
+                      <p className="font-black uppercase text-sm lg:text-base xl:text-lg mb-2">Opposition</p>
+                      <div className="space-y-1 text-sm lg:text-base">
                         <p>• Leader of Opp.</p>
                         <p>• Deputy LO</p>
                         <p>• Opp. Whip</p>
@@ -111,8 +127,8 @@ export default function Home() {
                     </div>
                   </div>
                   <div className="pt-4 border-t-4 border-foreground">
-                    <p className="text-6xl font-black">6</p>
-                    <p className="font-bold uppercase tracking-wider text-muted-foreground">Debaters per Room</p>
+                    <p className="text-6xl lg:text-7xl xl:text-8xl font-black leading-none">6</p>
+                    <p className="font-bold uppercase tracking-wider text-muted-foreground lg:text-base xl:text-lg mt-2">Debaters per Room</p>
                   </div>
                 </div>
               </div>
@@ -193,15 +209,15 @@ export default function Home() {
               HOW IT WORKS
             </h2>
           </div>
-          <div className="grid md:grid-cols-4 gap-8">
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto_minmax(0,1fr)_auto_minmax(0,1fr)] gap-8 lg:gap-6 items-stretch">
             {[
               { step: "01", title: "Create Room", desc: "Generate a debate room with AI motion" },
               { step: "02", title: "Join Teams", desc: "Debaters join as Gov or Opposition" },
               { step: "03", title: "Debate Live", desc: "Speak while AI transcribes in real-time" },
               { step: "04", title: "Get Feedback", desc: "Review argument map and AI analysis" }
             ].map((item, index) => (
-              <div key={index} className="relative">
-                <div className="brutalist-border brutalist-shadow p-6">
+              <Fragment key={index}>
+                <div className="brutalist-border brutalist-shadow brutalist-shadow-hover transition-all p-6 bg-background h-full">
                   <span className="text-6xl font-black text-muted-foreground/30">
                     {item.step}
                   </span>
@@ -213,11 +229,11 @@ export default function Home() {
                   </p>
                 </div>
                 {index < 3 && (
-                  <div className="hidden md:block absolute top-1/2 -right-4 transform -translate-y-1/2">
-                    <ArrowRight className="h-8 w-8" />
+                  <div className="flex items-center justify-center" aria-hidden="true">
+                    <ArrowRight className="h-10 w-10 rotate-90 lg:rotate-0 shrink-0" strokeWidth={3} />
                   </div>
                 )}
-              </div>
+              </Fragment>
             ))}
           </div>
         </div>
@@ -262,13 +278,20 @@ export default function Home() {
                   <ArrowRight className="ml-4 h-8 w-8" />
                 </Button>
               </Link>
-            ) : (
-              <a href={getLoginUrl()}>
+            ) : isOAuthConfigured ? (
+              <a href={getLoginUrl()!}>
                 <Button size="lg" className="brutalist-border brutalist-shadow-lg brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-12 py-8 h-auto text-xl">
                   Start Free
                   <ArrowRight className="ml-4 h-8 w-8" />
                 </Button>
               </a>
+            ) : (
+              <Link href="/lobby">
+                <Button size="lg" className="brutalist-border brutalist-shadow-lg brutalist-shadow-hover transition-all uppercase font-black tracking-wider px-12 py-8 h-auto text-xl">
+                  Start Free (Dev)
+                  <ArrowRight className="ml-4 h-8 w-8" />
+                </Button>
+              </Link>
             )}
           </div>
         </div>

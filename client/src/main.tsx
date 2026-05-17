@@ -18,7 +18,12 @@ const redirectToLoginIfUnauthorized = (error: unknown) => {
 
   if (!isUnauthorized) return;
 
-  window.location.href = getLoginUrl();
+  // When Manus OAuth is not configured (local dev), don't redirect to an
+  // invalid URL. The user will see the unauthenticated UI instead.
+  const loginUrl = getLoginUrl();
+  if (!loginUrl) return;
+
+  window.location.href = loginUrl;
 };
 
 queryClient.getQueryCache().subscribe(event => {

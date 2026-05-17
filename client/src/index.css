@@ -223,6 +223,14 @@
     font-weight: 900;
     text-transform: uppercase;
   }
+
+  /* On 2-column hero layouts (lg+), the headline shares horizontal space with
+     the format card, so cap scaling against the column rather than viewport. */
+  @media (min-width: 1024px) {
+    .text-massive {
+      font-size: clamp(4rem, 6.5vw, 8rem);
+    }
+  }
   
   .text-display {
     font-size: clamp(2rem, 6vw, 5rem);

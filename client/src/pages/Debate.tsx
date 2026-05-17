@@ -6,6 +6,7 @@ import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
+import { useModeratorVoice } from "@/hooks/useModeratorVoice";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useParams } from "wouter";
 import { 
@@ -63,9 +64,8 @@ export default function Debate() {
   // Transcript state
   const [liveTranscript, setLiveTranscript] = useState<Array<{speaker: string, text: string, timestamp: number}>>([]);
   
-  // AI Moderator state
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const speechSynthRef = useRef<SpeechSynthesisUtterance | null>(null);
+  // AI Moderator voice (ElevenLabs with browser TTS fallback).
+  const { speak: speakAnnouncement, isSpeaking } = useModeratorVoice();
   
   const utils = trpc.useUtils();
 
@@ -128,36 +128,7 @@ export default function Debate() {
     timeRemaining < (currentSpeaker?.time || 420) - 60 &&
     timeRemaining > 60;
 
-  // AI Moderator speech function
-  const speakAnnouncement = useCallback((text: string) => {
-    if ('speechSynthesis' in window) {
-      // Cancel any ongoing speech
-      window.speechSynthesis.cancel();
-      
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 0.9;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      
-      // Try to get a good voice
-      const voices = window.speechSynthesis.getVoices();
-      const preferredVoice = voices.find(v => 
-        v.name.includes('Google') || 
-        v.name.includes('Microsoft') || 
-        v.lang.startsWith('en')
-      );
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-      }
-      
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => setIsSpeaking(false);
-      utterance.onerror = () => setIsSpeaking(false);
-      
-      speechSynthRef.current = utterance;
-      window.speechSynthesis.speak(utterance);
-    }
-  }, []);
+  // speakAnnouncement is now provided by useModeratorVoice() above.
 
   // Timer effect - runs independently when started
   useEffect(() => {
@@ -216,7 +187,7 @@ export default function Debate() {
     }
   }, [roomData?.room.status, roomCode, navigate]);
 
-  // Cleanup on unmount
+  // Cleanup on unmount (voice cleanup is handled by useModeratorVoice).
   useEffect(() => {
     return () => {
       if (timerIntervalRef.current) {
@@ -225,7 +196,6 @@ export default function Debate() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
-      window.speechSynthesis.cancel();
     };
   }, []);
 

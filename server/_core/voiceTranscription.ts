@@ -74,19 +74,14 @@ export async function transcribeAudio(
   options: TranscribeOptions
 ): Promise<TranscriptionResponse | TranscriptionError> {
   try {
-    // Step 1: Validate environment configuration
-    if (!ENV.forgeApiUrl) {
-      return {
-        error: "Voice transcription service is not configured",
-        code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_URL is not set"
-      };
-    }
-    if (!ENV.forgeApiKey) {
+    // Step 1: Validate environment configuration.
+    // Accept either Manus Forge keys or a standard OPENAI_API_KEY.
+    const apiKey = ENV.forgeApiKey || ENV.openaiApiKey;
+    if (!apiKey) {
       return {
         error: "Voice transcription service authentication is missing",
         code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_KEY is not set"
+        details: "Set OPENAI_API_KEY (or BUILT_IN_FORGE_API_KEY for Manus)"
       };
     }
 
@@ -142,11 +137,12 @@ export async function transcribeAudio(
     );
     formData.append("prompt", prompt);
 
-    // Step 4: Call the transcription service
-    const baseUrl = ENV.forgeApiUrl.endsWith("/")
-      ? ENV.forgeApiUrl
-      : `${ENV.forgeApiUrl}/`;
-    
+    // Step 4: Call the transcription service.
+    // Use Manus Forge when configured, otherwise fall back to OpenAI directly.
+    const baseUrl = ENV.forgeApiUrl
+      ? (ENV.forgeApiUrl.endsWith("/") ? ENV.forgeApiUrl : `${ENV.forgeApiUrl}/`)
+      : "https://api.openai.com/";
+
     const fullUrl = new URL(
       "v1/audio/transcriptions",
       baseUrl
@@ -155,7 +151,7 @@ export async function transcribeAudio(
     const response = await fetch(fullUrl, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${ENV.forgeApiKey}`,
+        authorization: `Bearer ${apiKey}`,
         "Accept-Encoding": "identity",
       },
       body: formData,

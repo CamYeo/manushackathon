@@ -209,15 +209,44 @@ const normalizeToolChoice = (
   return toolChoice;
 };
 
-const resolveApiUrl = () =>
-  ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
-    ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
-    : "https://forge.manus.im/v1/chat/completions";
+// LLM provider resolution: Forge (Manus) > Gemini (Google) > OpenAI.
+type LLMProvider = "forge" | "gemini" | "openai";
 
-const assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+const resolveProvider = (): LLMProvider => {
+  if (ENV.forgeApiKey) return "forge";
+  if (ENV.geminiApiKey) return "gemini";
+  if (ENV.openaiApiKey) return "openai";
+  throw new Error(
+    "No LLM API key configured. Set GEMINI_API_KEY, OPENAI_API_KEY, or BUILT_IN_FORGE_API_KEY."
+  );
+};
+
+const resolveApiUrl = (): string => {
+  const provider = resolveProvider();
+  if (provider === "forge") {
+    const base = ENV.forgeApiUrl.trim().length > 0
+      ? ENV.forgeApiUrl.replace(/\/$/, "")
+      : "https://forge.manus.im";
+    return `${base}/v1/chat/completions`;
   }
+  if (provider === "gemini") {
+    // Google's OpenAI-compatible endpoint for Gemini models.
+    return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+  }
+  return "https://api.openai.com/v1/chat/completions";
+};
+
+const resolveApiKey = (): string => {
+  const provider = resolveProvider();
+  if (provider === "forge") return ENV.forgeApiKey;
+  if (provider === "gemini") return ENV.geminiApiKey;
+  return ENV.openaiApiKey;
+};
+
+const resolveModel = (): string => {
+  const provider = resolveProvider();
+  if (provider === "forge" || provider === "gemini") return "gemini-2.5-flash";
+  return "gpt-4o-mini";
 };
 
 const normalizeResponseFormat = ({
@@ -266,7 +295,7 @@ const normalizeResponseFormat = ({
 };
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
+  const apiKey = resolveApiKey();
 
   const {
     messages,
@@ -280,7 +309,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   } = params;
 
   const payload: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
+    model: resolveModel(),
     messages: messages.map(normalizeMessage),
   };
 
@@ -296,9 +325,11 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.tool_choice = normalizedToolChoice;
   }
 
-  payload.max_tokens = 32768
-  payload.thinking = {
-    "budget_tokens": 128
+  payload.max_tokens = 32768;
+
+  // Gemini-specific "thinking" param — only send when using Forge proxy.
+  if (resolveProvider() === "forge") {
+    payload.thinking = { budget_tokens: 128 };
   }
 
   const normalizedResponseFormat = normalizeResponseFormat({
@@ -316,7 +347,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
+      authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(payload),
   });
