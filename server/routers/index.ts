@@ -11,6 +11,7 @@ import { feedbackRouter } from "./feedback.router";
 import { violationRouter } from "./violation.router";
 import { constantsRouter } from "./constants.router";
 import { ttsRouter } from "./tts.router";
+import { transcriptRouter } from "./transcript.router";
 
 export const appRouter = router({
   system: systemRouter,
@@ -25,6 +26,7 @@ export const appRouter = router({
   violation: violationRouter,
   constants: constantsRouter,
   tts: ttsRouter,
+  transcript: transcriptRouter,
 });
 
 export type AppRouter = typeof appRouter;

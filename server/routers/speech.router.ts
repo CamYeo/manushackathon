@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { protectedProcedure, router } from "../_core/trpc";
-import { transcribeAudio } from "../_core/voiceTranscription";
 import { TRPCError } from "@trpc/server";
 import * as db from "../db";
 
@@ -86,20 +85,29 @@ export const speechRouter = router({
       timestamp: z.number().optional(),
     }))
     .mutation(async ({ input }) => {
+      const { transcribeBuffer } = await import('../_core/transcribeBuffer');
+
       const audioBuffer = Buffer.from(input.audioData, 'base64');
 
-      const { storagePut } = await import('../storage');
-      const fileName = `audio/${input.speechId}/${Date.now()}.webm`;
-      const { url: audioUrl } = await storagePut(fileName, audioBuffer, 'audio/webm');
+      if (audioBuffer.length < 1000) {
+        console.log('[Transcription] Audio too small:', audioBuffer.length, 'bytes');
+        return {
+          transcript: '',
+          segments: [],
+        };
+      }
 
-      const result = await transcribeAudio({
-        audioUrl,
-        language: "en",
-        prompt: "Transcribe this debate speech. Focus on clarity and accuracy.",
+      console.log('[Transcription] Processing audio directly:', audioBuffer.length, 'bytes');
+
+      const result = await transcribeBuffer({
+        audioBuffer,
+        mimeType: 'audio/webm',
+        language: 'en',
+        prompt: 'Transcribe this debate speech clearly and accurately.',
       });
 
       if ('error' in result) {
-        console.error('Transcription error:', result.error);
+        console.error('[Transcription] Error:', result.error, result.details);
         return {
           transcript: '',
           segments: [],
@@ -107,19 +115,34 @@ export const speechRouter = router({
       }
 
       const speech = await db.getSpeechById(input.speechId);
-      const existingTranscript = speech?.transcript || '';
+      if (!speech) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Speech not found" });
+      }
+
+      const existingTranscript = speech.transcript || '';
       const newTranscript = existingTranscript
         ? `${existingTranscript} ${result.text}`
         : result.text;
 
       await db.updateSpeech(input.speechId, {
         transcript: newTranscript,
-        audioUrl,
+      });
+
+      const latestSeq = await db.getLatestTranscriptSequence(speech.roomId);
+      await db.createTranscriptSegment({
+        roomId: speech.roomId,
+        speechId: input.speechId,
+        speakerRole: speech.speakerRole,
+        speakerName: null,
+        text: result.text,
+        timestamp: input.timestamp || 0,
+        sequenceNumber: latestSeq + 1,
       });
 
       return {
         transcript: result.text,
         segments: result.segments,
+        sequenceNumber: latestSeq + 1,
       };
     }),
 });
