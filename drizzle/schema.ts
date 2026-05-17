@@ -151,6 +151,22 @@ export const debateFeedback = mysqlTable("debate_feedback", {
 export type DebateFeedback = typeof debateFeedback.$inferSelect;
 export type InsertDebateFeedback = typeof debateFeedback.$inferInsert;
 
+// Live transcript segments for real-time syncing
+export const transcriptSegments = mysqlTable("transcript_segments", {
+  id: int("id").autoincrement().primaryKey(),
+  roomId: int("roomId").notNull(),
+  speechId: int("speechId").notNull(),
+  speakerRole: varchar("speakerRole", { length: 64 }).notNull(),
+  speakerName: varchar("speakerName", { length: 255 }),
+  text: text("text").notNull(),
+  timestamp: int("timestamp").notNull(), // seconds into the speech
+  sequenceNumber: int("sequenceNumber").notNull(), // for ordering
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type TranscriptSegment = typeof transcriptSegments.$inferSelect;
+export type InsertTranscriptSegment = typeof transcriptSegments.$inferInsert;
+
 // Rule violations flagged during debate
 export const ruleViolations = mysqlTable("rule_violations", {
   id: int("id").autoincrement().primaryKey(),

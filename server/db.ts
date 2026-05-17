@@ -9,7 +9,8 @@ import {
   pointsOfInformation, InsertPointOfInformation,
   argumentNodes, InsertArgumentNode,
   debateFeedback, InsertDebateFeedback,
-  ruleViolations, InsertRuleViolation
+  ruleViolations, InsertRuleViolation,
+  transcriptSegments, InsertTranscriptSegment
 } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
@@ -420,4 +421,53 @@ export async function getRoomViolations(roomId: number) {
     .from(ruleViolations)
     .where(eq(ruleViolations.roomId, roomId))
     .orderBy(ruleViolations.createdAt);
+}
+
+// ============ TRANSCRIPT SEGMENT OPERATIONS ============
+
+export async function createTranscriptSegment(segment: InsertTranscriptSegment) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.insert(transcriptSegments).values(segment);
+  return result[0].insertId;
+}
+
+export async function getRoomTranscriptSegments(roomId: number, afterSequence?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  
+  if (afterSequence !== undefined) {
+    return await db.select()
+      .from(transcriptSegments)
+      .where(and(
+        eq(transcriptSegments.roomId, roomId),
+        sql`${transcriptSegments.sequenceNumber} > ${afterSequence}`
+      ))
+      .orderBy(transcriptSegments.sequenceNumber);
+  }
+  
+  return await db.select()
+    .from(transcriptSegments)
+    .where(eq(transcriptSegments.roomId, roomId))
+    .orderBy(transcriptSegments.sequenceNumber);
+}
+
+export async function getLatestTranscriptSequence(roomId: number): Promise<number> {
+  const db = await getDb();
+  if (!db) return 0;
+  
+  const result = await db.select({ maxSeq: sql<number>`COALESCE(MAX(${transcriptSegments.sequenceNumber}), 0)` })
+    .from(transcriptSegments)
+    .where(eq(transcriptSegments.roomId, roomId));
+  
+  return result[0]?.maxSeq || 0;
+}
+
+export async function deleteRoomTranscriptSegments(roomId: number) {
+  const db = await getDb();
+  if (!db) return;
+  
+  await db.delete(transcriptSegments)
+    .where(eq(transcriptSegments.roomId, roomId));
 }

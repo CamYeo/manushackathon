@@ -15,6 +15,13 @@
       "when": 1769829665110,
       "tag": "0001_thick_hiroim",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1769836474907,
+      "tag": "0002_soft_mole_man",
+      "breakpoints": true
     }
   ]
 }

@@ -6,7 +6,6 @@ import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
-import { useModeratorVoice } from "@/hooks/useModeratorVoice";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useParams } from "wouter";
 import { 
@@ -34,6 +33,17 @@ const SPEAKING_ORDER = [
   { role: "government_reply", team: "government", label: "Government Reply", time: 240 },
 ];
 
+const ROLE_LABELS: Record<string, string> = {
+  prime_minister: "Prime Minister",
+  leader_of_opposition: "Leader of Opposition",
+  deputy_prime_minister: "Deputy Prime Minister",
+  deputy_leader_of_opposition: "Deputy Leader of Opposition",
+  government_whip: "Government Whip",
+  opposition_whip: "Opposition Whip",
+  opposition_reply: "Opposition Reply",
+  government_reply: "Government Reply",
+};
+
 function formatTime(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
@@ -52,20 +62,35 @@ export default function Debate() {
   const [isTimerRunning, setIsTimerRunning] = useState(false);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [currentSpeechId, setCurrentSpeechId] = useState<number | null>(null);
+  const currentSpeechIdRef = useRef<number | null>(null); // Ref to avoid stale closure
+  const timeRemainingRef = useRef(420); // Ref for accurate timestamp in transcription
   
   // Audio state
   const [isMicActive, setIsMicActive] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const audioChunksRef = useRef<Blob[]>([]); // All accumulated audio chunks
+  const pendingChunksRef = useRef<Blob[]>([]); // Chunks waiting to be transcribed
+  const processedIndexRef = useRef(0); // Index of last processed chunk
   const streamRef = useRef<MediaStream | null>(null);
+  const transcriptionIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isProcessingRef = useRef(false); // Prevent concurrent transcription calls
   
-  // Transcript state
-  const [liveTranscript, setLiveTranscript] = useState<Array<{speaker: string, text: string, timestamp: number}>>([]);
+  // Transcript state - now synced from server
+  const [liveTranscript, setLiveTranscript] = useState<Array<{
+    id: number;
+    speaker: string;
+    text: string;
+    timestamp: number;
+    sequenceNumber: number;
+  }>>([]);
+  const [lastSequence, setLastSequence] = useState(0);
   
-  // AI Moderator voice (ElevenLabs with browser TTS fallback).
-  const { speak: speakAnnouncement, isSpeaking } = useModeratorVoice();
+  // AI Moderator state
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const speechSynthRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const isSpeakingRef = useRef(false); // Ref to track speaking state for async callbacks
   
   const utils = trpc.useUtils();
 
@@ -76,6 +101,65 @@ export default function Debate() {
       refetchInterval: 5000,
     }
   );
+
+  // Poll for transcript updates every 2 seconds
+  const { data: transcriptData } = trpc.transcript.poll.useQuery(
+    { 
+      roomId: roomData?.room.id || 0, 
+      afterSequence: lastSequence 
+    },
+    { 
+      enabled: !!roomData?.room.id && roomData.room.status === "in_progress",
+      refetchInterval: 2000,
+    }
+  );
+
+  // Update local transcript when new segments arrive from server
+  useEffect(() => {
+    if (transcriptData?.segments && transcriptData.segments.length > 0) {
+      const newSegments = transcriptData.segments.map(seg => ({
+        id: seg.id,
+        speaker: ROLE_LABELS[seg.speakerRole] || seg.speakerRole,
+        text: seg.text,
+        timestamp: seg.timestamp,
+        sequenceNumber: seg.sequenceNumber,
+      }));
+      
+      setLiveTranscript(prev => {
+        // Merge new segments, avoiding duplicates
+        const existingIds = new Set(prev.map(s => s.id));
+        const uniqueNew = newSegments.filter(s => !existingIds.has(s.id));
+        return [...prev, ...uniqueNew].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+      });
+      
+      // Update last sequence
+      const maxSeq = Math.max(...newSegments.map(s => s.sequenceNumber));
+      setLastSequence(prev => Math.max(prev, maxSeq));
+    }
+  }, [transcriptData]);
+
+  // Load full transcript on mount / reconnect (rehydration)
+  const { data: fullTranscript } = trpc.transcript.getAll.useQuery(
+    { roomId: roomData?.room.id || 0 },
+    { 
+      enabled: !!roomData?.room.id && roomData.room.status === "in_progress" && lastSequence === 0,
+    }
+  );
+
+  useEffect(() => {
+    if (fullTranscript?.segments && fullTranscript.segments.length > 0 && lastSequence === 0) {
+      const segments = fullTranscript.segments.map(seg => ({
+        id: seg.id,
+        speaker: ROLE_LABELS[seg.speakerRole] || seg.speakerRole,
+        text: seg.text,
+        timestamp: seg.timestamp,
+        sequenceNumber: seg.sequenceNumber,
+      }));
+      setLiveTranscript(segments);
+      const maxSeq = Math.max(...segments.map(s => s.sequenceNumber));
+      setLastSequence(maxSeq);
+    }
+  }, [fullTranscript, lastSequence]);
 
   const createSpeech = trpc.speech.create.useMutation();
   const endSpeech = trpc.speech.end.useMutation();
@@ -128,7 +212,51 @@ export default function Debate() {
     timeRemaining < (currentSpeaker?.time || 420) - 60 &&
     timeRemaining > 60;
 
-  // speakAnnouncement is now provided by useModeratorVoice() above.
+  // AI Moderator speech function - returns a promise that resolves when speech ends
+  const speakAnnouncement = useCallback((text: string): Promise<void> => {
+    return new Promise((resolve) => {
+      if ('speechSynthesis' in window) {
+        // Cancel any ongoing speech
+        window.speechSynthesis.cancel();
+        
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 0.9;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        
+        // Try to get a good voice
+        const voices = window.speechSynthesis.getVoices();
+        const preferredVoice = voices.find(v => 
+          v.name.includes('Google') || 
+          v.name.includes('Microsoft') || 
+          v.lang.startsWith('en')
+        );
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+        }
+        
+        utterance.onstart = () => {
+          setIsSpeaking(true);
+          isSpeakingRef.current = true;
+        };
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          resolve();
+        };
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          resolve();
+        };
+        
+        speechSynthRef.current = utterance;
+        window.speechSynthesis.speak(utterance);
+      } else {
+        resolve();
+      }
+    });
+  }, []);
 
   // Timer effect - runs independently when started
   useEffect(() => {
@@ -136,8 +264,9 @@ export default function Debate() {
       timerIntervalRef.current = setInterval(() => {
         setTimeRemaining(prev => {
           const newTime = prev - 1;
+          timeRemainingRef.current = newTime; // Keep ref in sync
           
-          // Time warnings
+          // Time warnings - don't await these, just fire and forget
           if (newTime === 60) {
             speakAnnouncement("One minute remaining.");
           } else if (newTime === 30) {
@@ -162,12 +291,11 @@ export default function Debate() {
     }
   }, [isTimerRunning, speakAnnouncement]);
 
-  // Reset timer when speaker changes
+  // Reset timer when speaker changes (but don't clear transcript - it's synced from server)
   useEffect(() => {
     if (currentSpeaker) {
       setTimeRemaining(currentSpeaker.time);
       setIsTimerRunning(false);
-      setLiveTranscript([]);
       
       // Announce new speaker
       if (roomData?.room.status === "in_progress") {
@@ -187,62 +315,110 @@ export default function Debate() {
     }
   }, [roomData?.room.status, roomCode, navigate]);
 
-  // Cleanup on unmount (voice cleanup is handled by useModeratorVoice).
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current);
       }
+      if (transcriptionIntervalRef.current) {
+        clearInterval(transcriptionIntervalRef.current);
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
+      window.speechSynthesis.cancel();
     };
   }, []);
 
-  // Process audio and transcribe
-  const processAudioChunk = useCallback(async () => {
-    if (audioChunksRef.current.length === 0 || !currentSpeechId) return;
+  // Process audio and transcribe - queue-based approach that never loses data
+  const processAudioChunk = useCallback(async (isFinal: boolean = false) => {
+    const speechId = currentSpeechIdRef.current;
     
-    const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-    audioChunksRef.current = [];
+    // Check if we have new chunks to process
+    const totalChunks = audioChunksRef.current.length;
+    const processedCount = processedIndexRef.current;
+    
+    if (totalChunks <= processedCount || !speechId) {
+      console.log("[Transcription] Skipping - no new chunks", { total: totalChunks, processed: processedCount, speechId });
+      return;
+    }
+    
+    // Don't process if AI is speaking (unless final)
+    if (isSpeakingRef.current && !isFinal) {
+      console.log("[Transcription] Skipping - AI is speaking");
+      return;
+    }
+    
+    // Prevent concurrent processing
+    if (isProcessingRef.current && !isFinal) {
+      console.log("[Transcription] Skipping - already processing");
+      return;
+    }
+    
+    isProcessingRef.current = true;
+    
+    // Get unprocessed chunks (don't clear them, just mark as processed)
+    const chunksToProcess = audioChunksRef.current.slice(processedCount);
+    const newProcessedIndex = totalChunks;
+    
+    const audioBlob = new Blob(chunksToProcess, { type: 'audio/webm' });
     
     // Only process if blob is large enough (has actual audio)
-    if (audioBlob.size < 1000) return;
+    if (audioBlob.size < 500) {
+      console.log("[Transcription] Skipping - blob too small:", audioBlob.size);
+      isProcessingRef.current = false;
+      return;
+    }
     
+    console.log("[Transcription] Processing", chunksToProcess.length, "chunks,", audioBlob.size, "bytes", isFinal ? "(FINAL)" : "");
     setIsTranscribing(true);
     
     try {
       // Convert blob to base64
       const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve) => {
+      const base64Promise = new Promise<string>((resolve, reject) => {
         reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          resolve(base64);
+          const result = reader.result as string;
+          if (result) {
+            const base64 = result.split(',')[1];
+            resolve(base64);
+          } else {
+            reject(new Error("Failed to read audio"));
+          }
         };
+        reader.onerror = () => reject(reader.error);
       });
       reader.readAsDataURL(audioBlob);
       const base64Audio = await base64Promise;
       
+      // Calculate timestamp using ref for accuracy
+      const speakerTime = currentSpeaker?.time || 420;
+      const timestamp = speakerTime - timeRemainingRef.current;
+      
+      console.log("[Transcription] Sending to server, timestamp:", timestamp);
+      
       // Send to backend for transcription
-      const result = await transcribeSpeech.mutateAsync({
-        speechId: currentSpeechId,
+      await transcribeSpeech.mutateAsync({
+        speechId,
         audioData: base64Audio,
-        timestamp: (currentSpeaker?.time || 420) - timeRemaining,
+        timestamp,
       });
       
-      if (result.transcript && result.transcript.trim()) {
-        setLiveTranscript(prev => [...prev, {
-          speaker: currentSpeaker?.label || "Speaker",
-          text: result.transcript,
-          timestamp: (currentSpeaker?.time || 420) - timeRemaining,
-        }]);
-      }
+      // Only mark as processed AFTER successful transcription
+      processedIndexRef.current = newProcessedIndex;
+      console.log("[Transcription] Successfully transcribed, processed index now:", newProcessedIndex);
     } catch (err) {
-      console.error("Transcription error:", err);
+      console.error("[Transcription] Error:", err);
+      // Don't update processedIndex on error - will retry these chunks
     } finally {
       setIsTranscribing(false);
+      isProcessingRef.current = false;
     }
-  }, [currentSpeechId, currentSpeaker, timeRemaining, transcribeSpeech]);
+  }, [currentSpeaker, transcribeSpeech]);
 
   const startSpeech = useCallback(async () => {
     if (!roomData?.room.id || !currentSpeaker) return;
@@ -254,46 +430,90 @@ export default function Debate() {
         speakerRole: currentSpeaker.role,
         speechType: currentSpeaker.role.includes("reply") ? "reply" : "substantive",
       });
+      
+      // Update both state and ref for the speech ID
       setCurrentSpeechId(result.speechId);
+      currentSpeechIdRef.current = result.speechId;
+      
+      // Initialize time ref
+      timeRemainingRef.current = currentSpeaker.time;
+      
+      // Reset audio tracking refs
+      audioChunksRef.current = [];
+      processedIndexRef.current = 0;
+      isProcessingRef.current = false;
       
       // Start timer
       setIsTimerRunning(true);
       
-      // Start microphone recording
+      // First announce, THEN start recording (wait for AI to finish speaking)
+      await speakAnnouncement("Your time begins now.");
+      
+      // Now start microphone recording AFTER AI has finished speaking
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            sampleRate: 16000,
+            autoGainControl: true,
           } 
         });
         streamRef.current = stream;
         
-        const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: 'audio/webm;codecs=opus'
+        // Check for supported mime type
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+          ? 'audio/webm;codecs=opus' 
+          : MediaRecorder.isTypeSupported('audio/webm')
+            ? 'audio/webm'
+            : 'audio/mp4';
+        
+        console.log("[Recording] Using mime type:", mimeType);
+        
+        const mediaRecorder = new MediaRecorder(stream, { 
+          mimeType,
+          audioBitsPerSecond: 128000 // Good quality for speech
         });
         mediaRecorderRef.current = mediaRecorder;
-        audioChunksRef.current = [];
         
         mediaRecorder.ondataavailable = (event) => {
+          console.log("[Recording] Data available:", event.data.size, "bytes, state:", mediaRecorder.state);
           if (event.data.size > 0) {
+            // Always collect audio - we'll filter AI speech during transcription
             audioChunksRef.current.push(event.data);
-            // Process the chunk immediately when data is available
-            processAudioChunk();
+            console.log("[Recording] Chunk added, total chunks:", audioChunksRef.current.length);
           }
         };
         
-        // Process audio every 5 seconds for transcription
-        mediaRecorder.start(5000);
+        mediaRecorder.onerror = (event) => {
+          console.error("[Recording] MediaRecorder error:", event);
+          toast.error("Recording error occurred");
+        };
+        
+        mediaRecorder.onstop = () => {
+          console.log("[Recording] MediaRecorder stopped, total chunks:", audioChunksRef.current.length);
+        };
+        
+        // Start recording with 10 second timeslice for substantial audio chunks
+        // Longer chunks = better transcription quality
+        mediaRecorder.start(10000);
+        console.log("[Recording] Started with 10s timeslice");
         setIsRecording(true);
         setIsMicActive(true);
         
-        toast.success("Recording started");
-        speakAnnouncement("Your time begins now.");
+        // Set up interval to process chunks every 15 seconds
+        // This ensures we have at least one full chunk before processing
+        transcriptionIntervalRef.current = setInterval(() => {
+          const unprocessedCount = audioChunksRef.current.length - processedIndexRef.current;
+          console.log("[Recording] Interval tick, unprocessed chunks:", unprocessedCount, "AI speaking:", isSpeakingRef.current);
+          if (unprocessedCount > 0 && !isSpeakingRef.current && !isProcessingRef.current) {
+            processAudioChunk(false);
+          }
+        }, 15000); // Process every 15 seconds
+        
+        toast.success("Recording started - speak clearly into your microphone");
       } catch (err) {
         console.error("Failed to start recording:", err);
-        toast.error("Could not access microphone. Timer will still run.");
+        toast.error("Could not access microphone. Please check permissions.");
       }
     } catch (err) {
       toast.error("Failed to start speech");
@@ -301,6 +521,10 @@ export default function Debate() {
   }, [roomData?.room.id, currentSpeaker, createSpeech, processAudioChunk, speakAnnouncement]);
 
   const stopSpeech = useCallback(async () => {
+    console.log("[Recording] Stopping speech...");
+    console.log("[Recording] Total chunks collected:", audioChunksRef.current.length);
+    console.log("[Recording] Processed so far:", processedIndexRef.current);
+    
     // Stop timer
     setIsTimerRunning(false);
     if (timerIntervalRef.current) {
@@ -308,13 +532,36 @@ export default function Debate() {
       timerIntervalRef.current = null;
     }
     
-    // Stop recording and process final chunk
+    // Clear transcription interval first
+    if (transcriptionIntervalRef.current) {
+      clearInterval(transcriptionIntervalRef.current);
+      transcriptionIntervalRef.current = null;
+    }
+    
+    // Stop recording and process ALL remaining audio
     if (mediaRecorderRef.current && isRecording) {
+      // Request final data before stopping
+      if (mediaRecorderRef.current.state === 'recording') {
+        console.log("[Recording] Requesting final data...");
+        mediaRecorderRef.current.requestData(); // Force emit any pending data
+      }
+      
       mediaRecorderRef.current.stop();
       
-      // Process any remaining audio
-      if (audioChunksRef.current.length > 0) {
-        await processAudioChunk();
+      // Wait for ondataavailable to fire with final chunk
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      console.log("[Recording] After stop - total chunks:", audioChunksRef.current.length);
+      
+      // Process ALL remaining unprocessed audio (force final processing)
+      const unprocessedCount = audioChunksRef.current.length - processedIndexRef.current;
+      if (unprocessedCount > 0) {
+        console.log("[Recording] Processing final", unprocessedCount, "unprocessed chunks");
+        // Wait for any in-progress transcription to complete
+        while (isProcessingRef.current) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        await processAudioChunk(true); // Pass true for final processing
       }
       
       if (streamRef.current) {
@@ -323,16 +570,23 @@ export default function Debate() {
       }
       setIsRecording(false);
       setIsMicActive(false);
+      mediaRecorderRef.current = null;
     }
     
-    // End speech record
-    if (currentSpeechId && currentSpeaker) {
-      const duration = currentSpeaker.time - timeRemaining;
+    // End speech record using ref for accurate values
+    const speechId = currentSpeechIdRef.current;
+    if (speechId && currentSpeaker) {
+      const duration = currentSpeaker.time - timeRemainingRef.current;
+      console.log("[Recording] Ending speech, duration:", duration, "seconds");
       await endSpeech.mutateAsync({
-        speechId: currentSpeechId,
+        speechId,
         duration,
       });
     }
+    
+    // Clear audio refs
+    audioChunksRef.current = [];
+    processedIndexRef.current = 0;
     
     speakAnnouncement("Thank you. Moving to the next speaker.");
     
@@ -343,8 +597,10 @@ export default function Debate() {
       }, 2000);
     }
     
+    // Clear refs
     setCurrentSpeechId(null);
-  }, [currentSpeechId, currentSpeaker, timeRemaining, roomData?.room.id, isRecording, endSpeech, advanceSpeaker, processAudioChunk, speakAnnouncement]);
+    currentSpeechIdRef.current = null;
+  }, [currentSpeaker, roomData?.room.id, isRecording, endSpeech, advanceSpeaker, processAudioChunk, speakAnnouncement]);
 
   const toggleMic = useCallback(() => {
     if (streamRef.current) {
@@ -575,20 +831,23 @@ export default function Debate() {
               </CardContent>
             </Card>
 
-            {/* Live Transcript */}
+            {/* Live Transcript - Now synced from server */}
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
                   Live Transcript
                   {isTranscribing && <Loader2 className="w-4 h-4 animate-spin" />}
+                  <Badge variant="outline" className="ml-auto text-xs">
+                    {liveTranscript.length} segments
+                  </Badge>
                 </CardTitle>
               </CardHeader>
               <CardContent>
                 <ScrollArea className="h-48">
                   {liveTranscript.length > 0 ? (
                     <div className="space-y-3">
-                      {liveTranscript.map((entry, i) => (
-                        <div key={i} className="border-l-2 border-primary pl-3">
+                      {liveTranscript.map((entry) => (
+                        <div key={entry.id} className="border-l-2 border-primary pl-3">
                           <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
                             <span className="font-medium">{entry.speaker}</span>
                             <span>•</span>
