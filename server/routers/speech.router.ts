@@ -2,6 +2,10 @@ import { z } from "zod";
 import { protectedProcedure, router } from "../_core/trpc";
 import { TRPCError } from "@trpc/server";
 import * as db from "../db";
+import {
+  createScribeSingleUseToken,
+  SCRIBE_MODEL_ID,
+} from "../_core/scribeToken";
 
 export const speechRouter = router({
   create: protectedProcedure
@@ -74,75 +78,139 @@ export const speechRouter = router({
 
   getAll: protectedProcedure
     .input(z.object({ roomId: z.number() }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
+      const participant = await db.getParticipantWithUser(input.roomId, ctx.user.id);
+      if (!participant) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You are not in this room" });
+      }
       return await db.getRoomSpeeches(input.roomId);
     }),
 
-  transcribe: protectedProcedure
+  // Mint a short-lived, single-use ElevenLabs Scribe Realtime token.
+  //
+  // The browser never sees ELEVENLABS_API_KEY: it asks the server for a
+  // 15-minute single-use token bound to the active speech, then opens the
+  // Scribe Realtime WebSocket directly with that token.
+  createScribeToken: protectedProcedure
     .input(z.object({
-      audioData: z.string(),
+      roomId: z.number(),
       speechId: z.number(),
-      timestamp: z.number().optional(),
     }))
-    .mutation(async ({ input }) => {
-      const { transcribeBuffer } = await import('../_core/transcribeBuffer');
-
-      const audioBuffer = Buffer.from(input.audioData, 'base64');
-
-      if (audioBuffer.length < 1000) {
-        console.log('[Transcription] Audio too small:', audioBuffer.length, 'bytes');
-        return {
-          transcript: '',
-          segments: [],
-        };
-      }
-
-      console.log('[Transcription] Processing audio directly:', audioBuffer.length, 'bytes');
-
-      const result = await transcribeBuffer({
-        audioBuffer,
-        mimeType: 'audio/webm',
-        language: 'en',
-        prompt: 'Transcribe this debate speech clearly and accurately.',
-      });
-
-      if ('error' in result) {
-        console.error('[Transcription] Error:', result.error, result.details);
-        return {
-          transcript: '',
-          segments: [],
-        };
-      }
-
+    .mutation(async ({ ctx, input }) => {
       const speech = await db.getSpeechById(input.speechId);
       if (!speech) {
         throw new TRPCError({ code: "NOT_FOUND", message: "Speech not found" });
       }
+      if (speech.roomId !== input.roomId) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Speech does not belong to this room",
+        });
+      }
+      const participant = await db.getParticipantWithUser(speech.roomId, ctx.user.id);
+      if (!participant || participant.id !== speech.participantId) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "You can only transcribe your own speech",
+        });
+      }
 
-      const existingTranscript = speech.transcript || '';
+      const result = await createScribeSingleUseToken();
+      if ("error" in result) {
+        // Surface configuration / upstream failures explicitly — never
+        // silently degrade to "no transcription".
+        throw new TRPCError({
+          code:
+            result.code === "NOT_CONFIGURED"
+              ? "PRECONDITION_FAILED"
+              : "INTERNAL_SERVER_ERROR",
+          message: result.error,
+          cause: result.details,
+        });
+      }
+
+      return { token: result.token, modelId: SCRIBE_MODEL_ID };
+    }),
+
+  // Persist a finalized Scribe transcript segment for the active speech.
+  //
+  // Idempotency note: transcript_segments has no client-supplied id column,
+  // so true cross-request dedupe would require a schema change (out of scope
+  // for this phase). As a best-effort guard we drop a segment that exactly
+  // matches the most recent stored segment for the same speech + timestamp,
+  // which absorbs accidental double-sends / network retries. clientSegmentId
+  // is accepted for forward-compatibility but not yet persisted.
+  commitTranscriptSegment: protectedProcedure
+    .input(z.object({
+      roomId: z.number(),
+      speechId: z.number(),
+      text: z.string(),
+      timestamp: z.number().optional(),
+      clientSegmentId: z.string().optional(),
+      isFinal: z.boolean().optional(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const speech = await db.getSpeechById(input.speechId);
+      if (!speech) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Speech not found" });
+      }
+      if (speech.roomId !== input.roomId) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Speech does not belong to this room",
+        });
+      }
+      const participant = await db.getParticipantWithUser(speech.roomId, ctx.user.id);
+      if (!participant || participant.id !== speech.participantId) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "You can only commit transcript for your own speech",
+        });
+      }
+
+      const text = input.text.trim();
+      if (!text) {
+        return { committed: false as const, reason: "empty" as const };
+      }
+
+      const timestamp = input.timestamp ?? 0;
+
+      // Best-effort idempotency: skip if this exactly duplicates the most
+      // recent segment already stored for this speech at this timestamp.
+      const existingSegments = await db.getRoomTranscriptSegments(speech.roomId);
+      const lastForSpeech = existingSegments
+        .filter((s) => s.speechId === input.speechId)
+        .at(-1);
+      if (
+        lastForSpeech &&
+        lastForSpeech.text === text &&
+        lastForSpeech.timestamp === timestamp
+      ) {
+        return {
+          committed: false as const,
+          reason: "duplicate" as const,
+          sequenceNumber: lastForSpeech.sequenceNumber,
+        };
+      }
+
+      const existingTranscript = speech.transcript || "";
       const newTranscript = existingTranscript
-        ? `${existingTranscript} ${result.text}`
-        : result.text;
-
-      await db.updateSpeech(input.speechId, {
-        transcript: newTranscript,
-      });
+        ? `${existingTranscript} ${text}`
+        : text;
+      await db.updateSpeech(input.speechId, { transcript: newTranscript });
 
       const latestSeq = await db.getLatestTranscriptSequence(speech.roomId);
+      const sequenceNumber = latestSeq + 1;
       await db.createTranscriptSegment({
         roomId: speech.roomId,
         speechId: input.speechId,
         speakerRole: speech.speakerRole,
         speakerName: null,
-        text: result.text,
-        timestamp: input.timestamp || 0,
-        sequenceNumber: latestSeq + 1,
+        text,
+        timestamp,
+        sequenceNumber,
       });
 
-      return {
-        transcript: result.text,
-        segments: result.segments,
-        sequenceNumber: latestSeq + 1,
-      };
+      return { committed: true as const, sequenceNumber };
     }),
 });

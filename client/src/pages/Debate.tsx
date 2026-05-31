@@ -8,9 +8,11 @@ import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useParams } from "wouter";
-import { 
-  Mic, 
-  MicOff, 
+import { useScribe, CommitStrategy } from "@elevenlabs/react";
+import { useModeratorVoice } from "@/hooks/useModeratorVoice";
+import {
+  Mic,
+  MicOff,
   Hand,
   SkipForward,
   Clock,
@@ -53,10 +55,10 @@ function formatTime(seconds: number): string {
 export default function Debate() {
   const params = useParams<{ code: string }>();
   const roomCode = params.code?.toUpperCase() || "";
-  
+
   const { user, loading: authLoading } = useAuth();
   const [, navigate] = useLocation();
-  
+
   // Timer state
   const [timeRemaining, setTimeRemaining] = useState(420);
   const [isTimerRunning, setIsTimerRunning] = useState(false);
@@ -64,20 +66,18 @@ export default function Debate() {
   const [currentSpeechId, setCurrentSpeechId] = useState<number | null>(null);
   const currentSpeechIdRef = useRef<number | null>(null); // Ref to avoid stale closure
   const timeRemainingRef = useRef(420); // Ref for accurate timestamp in transcription
-  
-  // Audio state
-  const [isMicActive, setIsMicActive] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]); // All accumulated audio chunks
-  const pendingChunksRef = useRef<Blob[]>([]); // Chunks waiting to be transcribed
-  const processedIndexRef = useRef(0); // Index of last processed chunk
-  const streamRef = useRef<MediaStream | null>(null);
-  const transcriptionIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const isProcessingRef = useRef(false); // Prevent concurrent transcription calls
-  
-  // Transcript state - now synced from server
+
+  // Stable refs read by the (long-lived) Scribe callbacks so they never see
+  // a stale speech / room / speaker.
+  const roomIdRef = useRef<number | null>(null);
+  const speakerTimeRef = useRef(420);
+
+  // Speech-to-text status surfaced to the speaker. We never silently swallow
+  // a transcription failure: the speaker keeps the floor and can still end
+  // the speech, but the error is shown rather than spinning forever.
+  const [sttError, setSttError] = useState<string | null>(null);
+
+  // Transcript state - synced from server (canonical, cross-client)
   const [liveTranscript, setLiveTranscript] = useState<Array<{
     id: number;
     speaker: string;
@@ -86,17 +86,24 @@ export default function Debate() {
     sequenceNumber: number;
   }>>([]);
   const [lastSequence, setLastSequence] = useState(0);
-  
-  // AI Moderator state
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const speechSynthRef = useRef<SpeechSynthesisUtterance | null>(null);
-  const isSpeakingRef = useRef(false); // Ref to track speaking state for async callbacks
-  
+
+  // AI Moderator (Phase 2): ElevenLabs TTS via the server only (no browser
+  // voice fallback). Announcements are queued so they never overlap.
+  const { speak: speakRaw, isSpeaking } = useModeratorVoice();
+  // speakRaw's identity changes every render; the 1s timer effect and the
+  // mutation callbacks need a stable reference, so route through a ref.
+  const speakRef = useRef(speakRaw);
+  speakRef.current = speakRaw;
+  const speakAnnouncement = useCallback(
+    (text: string): Promise<void> => speakRef.current(text),
+    [],
+  );
+
   const utils = trpc.useUtils();
 
   const { data: roomData, isLoading } = trpc.room.get.useQuery(
     { roomCode },
-    { 
+    {
       enabled: !!roomCode,
       refetchInterval: 5000,
     }
@@ -104,11 +111,11 @@ export default function Debate() {
 
   // Poll for transcript updates every 2 seconds
   const { data: transcriptData } = trpc.transcript.poll.useQuery(
-    { 
-      roomId: roomData?.room.id || 0, 
-      afterSequence: lastSequence 
+    {
+      roomId: roomData?.room.id || 0,
+      afterSequence: lastSequence
     },
-    { 
+    {
       enabled: !!roomData?.room.id && roomData.room.status === "in_progress",
       refetchInterval: 2000,
     }
@@ -124,14 +131,14 @@ export default function Debate() {
         timestamp: seg.timestamp,
         sequenceNumber: seg.sequenceNumber,
       }));
-      
+
       setLiveTranscript(prev => {
         // Merge new segments, avoiding duplicates
         const existingIds = new Set(prev.map(s => s.id));
         const uniqueNew = newSegments.filter(s => !existingIds.has(s.id));
         return [...prev, ...uniqueNew].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
       });
-      
+
       // Update last sequence
       const maxSeq = Math.max(...newSegments.map(s => s.sequenceNumber));
       setLastSequence(prev => Math.max(prev, maxSeq));
@@ -141,7 +148,7 @@ export default function Debate() {
   // Load full transcript on mount / reconnect (rehydration)
   const { data: fullTranscript } = trpc.transcript.getAll.useQuery(
     { roomId: roomData?.room.id || 0 },
-    { 
+    {
       enabled: !!roomData?.room.id && roomData.room.status === "in_progress" && lastSequence === 0,
     }
   );
@@ -163,7 +170,13 @@ export default function Debate() {
 
   const createSpeech = trpc.speech.create.useMutation();
   const endSpeech = trpc.speech.end.useMutation();
-  const transcribeSpeech = trpc.speech.transcribe.useMutation();
+  const createScribeToken = trpc.speech.createScribeToken.useMutation();
+  const commitSegment = trpc.speech.commitTranscriptSegment.useMutation();
+  // The commit mutation object is recreated each render; the Scribe callback
+  // is long-lived, so reach it through a ref.
+  const commitSegmentRef = useRef(commitSegment);
+  commitSegmentRef.current = commitSegment;
+
   const advanceSpeaker = trpc.room.advanceSpeaker.useMutation({
     onSuccess: (data) => {
       if (data.completed) {
@@ -184,9 +197,66 @@ export default function Debate() {
     },
   });
 
+  // ElevenLabs Scribe Realtime STT. The browser never sees the API key; it
+  // connects with a server-minted single-use token. Microphone mode lets the
+  // SDK capture + encode + stream audio over the WebSocket internally. VAD
+  // commit strategy auto-finalizes segments on natural pauses, which suits
+  // continuous multi-minute debate speeches.
+  const scribe = useScribe({
+    commitStrategy: CommitStrategy.VAD,
+    languageCode: "en",
+    microphone: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+    onCommittedTranscript: ({ text }) => {
+      const speechId = currentSpeechIdRef.current;
+      const roomId = roomIdRef.current;
+      const trimmed = text.trim();
+      if (!speechId || !roomId || !trimmed) return;
+
+      const timestamp = Math.max(
+        0,
+        Math.round(speakerTimeRef.current - timeRemainingRef.current),
+      );
+
+      commitSegmentRef.current.mutate(
+        { roomId, speechId, text: trimmed, timestamp, isFinal: true },
+        {
+          onSuccess: () => {
+            // Pull the freshly-stored segment back fast so the speaker (and
+            // every other client) sees it without waiting for the 2s poll.
+            utils.transcript.poll.invalidate();
+          },
+          onError: (err) => {
+            setSttError(`Failed to save transcript: ${err.message}`);
+          },
+        },
+      );
+    },
+    onError: (err) => {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Live transcription connection error";
+      setSttError(message);
+    },
+    onAuthError: ({ error }) => {
+      setSttError(`Transcription authorization failed: ${error}`);
+    },
+  });
+
+  // Long-lived disconnect handle for unmount cleanup (scribe identity changes
+  // each render; the cleanup effect must run exactly once).
+  const scribeDisconnectRef = useRef(scribe.disconnect);
+  scribeDisconnectRef.current = scribe.disconnect;
+  const scribeConnectedRef = useRef(scribe.isConnected);
+  scribeConnectedRef.current = scribe.isConnected;
+
   const currentSpeakerIndex = roomData?.room.currentSpeakerIndex || 0;
   const currentSpeaker = SPEAKING_ORDER[currentSpeakerIndex];
-  
+
   // Build active speaking order based on who joined
   const participantRoles = new Set(roomData?.participants.map(p => p.speakerRole) || []);
   const activeSpeakingOrder = SPEAKING_ORDER.filter(speaker => {
@@ -198,65 +268,28 @@ export default function Debate() {
     }
     return participantRoles.has(speaker.role as any);
   });
-  
+
   const currentParticipant = roomData?.participants.find(
-    p => p.speakerRole === currentSpeaker?.role || 
+    p => p.speakerRole === currentSpeaker?.role ||
          (currentSpeaker?.role === "opposition_reply" && p.speakerRole === "leader_of_opposition") ||
          (currentSpeaker?.role === "government_reply" && p.speakerRole === "prime_minister")
   );
-  
+
   const myParticipant = roomData?.participants.find(p => p.userId === user?.id);
   const isMyTurn = currentParticipant?.userId === user?.id;
-  const canOfferPOI = myParticipant && 
+  const canOfferPOI = myParticipant &&
     myParticipant.team !== currentSpeaker?.team &&
     timeRemaining < (currentSpeaker?.time || 420) - 60 &&
     timeRemaining > 60;
 
-  // AI Moderator speech function - returns a promise that resolves when speech ends
-  const speakAnnouncement = useCallback((text: string): Promise<void> => {
-    return new Promise((resolve) => {
-      if ('speechSynthesis' in window) {
-        // Cancel any ongoing speech
-        window.speechSynthesis.cancel();
-        
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.9;
-        utterance.pitch = 1;
-        utterance.volume = 1;
-        
-        // Try to get a good voice
-        const voices = window.speechSynthesis.getVoices();
-        const preferredVoice = voices.find(v => 
-          v.name.includes('Google') || 
-          v.name.includes('Microsoft') || 
-          v.lang.startsWith('en')
-        );
-        if (preferredVoice) {
-          utterance.voice = preferredVoice;
-        }
-        
-        utterance.onstart = () => {
-          setIsSpeaking(true);
-          isSpeakingRef.current = true;
-        };
-        utterance.onend = () => {
-          setIsSpeaking(false);
-          isSpeakingRef.current = false;
-          resolve();
-        };
-        utterance.onerror = () => {
-          setIsSpeaking(false);
-          isSpeakingRef.current = false;
-          resolve();
-        };
-        
-        speechSynthRef.current = utterance;
-        window.speechSynthesis.speak(utterance);
-      } else {
-        resolve();
-      }
-    });
-  }, []);
+  // Keep refs the Scribe callbacks read in sync with the latest room/speaker.
+  useEffect(() => {
+    roomIdRef.current = roomData?.room.id ?? null;
+  }, [roomData?.room.id]);
+  useEffect(() => {
+    speakerTimeRef.current = currentSpeaker?.time ?? 420;
+  }, [currentSpeaker?.time]);
+
 
   // Timer effect - runs independently when started
   useEffect(() => {
@@ -265,7 +298,7 @@ export default function Debate() {
         setTimeRemaining(prev => {
           const newTime = prev - 1;
           timeRemainingRef.current = newTime; // Keep ref in sync
-          
+
           // Time warnings - don't await these, just fire and forget
           if (newTime === 60) {
             speakAnnouncement("One minute remaining.");
@@ -277,11 +310,11 @@ export default function Debate() {
             speakAnnouncement("Time is up. Please conclude your speech.");
             setIsTimerRunning(false);
           }
-          
+
           return newTime;
         });
       }, 1000);
-      
+
       return () => {
         if (timerIntervalRef.current) {
           clearInterval(timerIntervalRef.current);
@@ -296,7 +329,7 @@ export default function Debate() {
     if (currentSpeaker) {
       setTimeRemaining(currentSpeaker.time);
       setIsTimerRunning(false);
-      
+
       // Announce new speaker
       if (roomData?.room.status === "in_progress") {
         const speakerName = currentParticipant?.user?.name || "the next speaker";
@@ -321,108 +354,18 @@ export default function Debate() {
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current);
       }
-      if (transcriptionIntervalRef.current) {
-        clearInterval(transcriptionIntervalRef.current);
+      if (scribeConnectedRef.current) {
+        scribeDisconnectRef.current();
       }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-      }
-      window.speechSynthesis.cancel();
     };
   }, []);
 
-  // Process audio and transcribe - queue-based approach that never loses data
-  const processAudioChunk = useCallback(async (isFinal: boolean = false) => {
-    const speechId = currentSpeechIdRef.current;
-    
-    // Check if we have new chunks to process
-    const totalChunks = audioChunksRef.current.length;
-    const processedCount = processedIndexRef.current;
-    
-    if (totalChunks <= processedCount || !speechId) {
-      console.log("[Transcription] Skipping - no new chunks", { total: totalChunks, processed: processedCount, speechId });
-      return;
-    }
-    
-    // Don't process if AI is speaking (unless final)
-    if (isSpeakingRef.current && !isFinal) {
-      console.log("[Transcription] Skipping - AI is speaking");
-      return;
-    }
-    
-    // Prevent concurrent processing
-    if (isProcessingRef.current && !isFinal) {
-      console.log("[Transcription] Skipping - already processing");
-      return;
-    }
-    
-    isProcessingRef.current = true;
-    
-    // Get unprocessed chunks (don't clear them, just mark as processed)
-    const chunksToProcess = audioChunksRef.current.slice(processedCount);
-    const newProcessedIndex = totalChunks;
-    
-    const audioBlob = new Blob(chunksToProcess, { type: 'audio/webm' });
-    
-    // Only process if blob is large enough (has actual audio)
-    if (audioBlob.size < 500) {
-      console.log("[Transcription] Skipping - blob too small:", audioBlob.size);
-      isProcessingRef.current = false;
-      return;
-    }
-    
-    console.log("[Transcription] Processing", chunksToProcess.length, "chunks,", audioBlob.size, "bytes", isFinal ? "(FINAL)" : "");
-    setIsTranscribing(true);
-    
-    try {
-      // Convert blob to base64
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onloadend = () => {
-          const result = reader.result as string;
-          if (result) {
-            const base64 = result.split(',')[1];
-            resolve(base64);
-          } else {
-            reject(new Error("Failed to read audio"));
-          }
-        };
-        reader.onerror = () => reject(reader.error);
-      });
-      reader.readAsDataURL(audioBlob);
-      const base64Audio = await base64Promise;
-      
-      // Calculate timestamp using ref for accuracy
-      const speakerTime = currentSpeaker?.time || 420;
-      const timestamp = speakerTime - timeRemainingRef.current;
-      
-      console.log("[Transcription] Sending to server, timestamp:", timestamp);
-      
-      // Send to backend for transcription
-      await transcribeSpeech.mutateAsync({
-        speechId,
-        audioData: base64Audio,
-        timestamp,
-      });
-      
-      // Only mark as processed AFTER successful transcription
-      processedIndexRef.current = newProcessedIndex;
-      console.log("[Transcription] Successfully transcribed, processed index now:", newProcessedIndex);
-    } catch (err) {
-      console.error("[Transcription] Error:", err);
-      // Don't update processedIndex on error - will retry these chunks
-    } finally {
-      setIsTranscribing(false);
-      isProcessingRef.current = false;
-    }
-  }, [currentSpeaker, transcribeSpeech]);
-
   const startSpeech = useCallback(async () => {
     if (!roomData?.room.id || !currentSpeaker) return;
-    
+
+    setSttError(null);
+
+    let speechId: number;
     try {
       // Create speech record
       const result = await createSpeech.mutateAsync({
@@ -430,192 +373,120 @@ export default function Debate() {
         speakerRole: currentSpeaker.role,
         speechType: currentSpeaker.role.includes("reply") ? "reply" : "substantive",
       });
-      
-      // Update both state and ref for the speech ID
-      setCurrentSpeechId(result.speechId);
-      currentSpeechIdRef.current = result.speechId;
-      
-      // Initialize time ref
-      timeRemainingRef.current = currentSpeaker.time;
-      
-      // Reset audio tracking refs
-      audioChunksRef.current = [];
-      processedIndexRef.current = 0;
-      isProcessingRef.current = false;
-      
-      // Start timer
-      setIsTimerRunning(true);
-      
-      // First announce, THEN start recording (wait for AI to finish speaking)
-      await speakAnnouncement("Your time begins now.");
-      
-      // Now start microphone recording AFTER AI has finished speaking
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          } 
-        });
-        streamRef.current = stream;
-        
-        // Check for supported mime type
-        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-          ? 'audio/webm;codecs=opus' 
-          : MediaRecorder.isTypeSupported('audio/webm')
-            ? 'audio/webm'
-            : 'audio/mp4';
-        
-        console.log("[Recording] Using mime type:", mimeType);
-        
-        const mediaRecorder = new MediaRecorder(stream, { 
-          mimeType,
-          audioBitsPerSecond: 128000 // Good quality for speech
-        });
-        mediaRecorderRef.current = mediaRecorder;
-        
-        mediaRecorder.ondataavailable = (event) => {
-          console.log("[Recording] Data available:", event.data.size, "bytes, state:", mediaRecorder.state);
-          if (event.data.size > 0) {
-            // Always collect audio - we'll filter AI speech during transcription
-            audioChunksRef.current.push(event.data);
-            console.log("[Recording] Chunk added, total chunks:", audioChunksRef.current.length);
-          }
-        };
-        
-        mediaRecorder.onerror = (event) => {
-          console.error("[Recording] MediaRecorder error:", event);
-          toast.error("Recording error occurred");
-        };
-        
-        mediaRecorder.onstop = () => {
-          console.log("[Recording] MediaRecorder stopped, total chunks:", audioChunksRef.current.length);
-        };
-        
-        // Start recording with 10 second timeslice for substantial audio chunks
-        // Longer chunks = better transcription quality
-        mediaRecorder.start(10000);
-        console.log("[Recording] Started with 10s timeslice");
-        setIsRecording(true);
-        setIsMicActive(true);
-        
-        // Set up interval to process chunks every 15 seconds
-        // This ensures we have at least one full chunk before processing
-        transcriptionIntervalRef.current = setInterval(() => {
-          const unprocessedCount = audioChunksRef.current.length - processedIndexRef.current;
-          console.log("[Recording] Interval tick, unprocessed chunks:", unprocessedCount, "AI speaking:", isSpeakingRef.current);
-          if (unprocessedCount > 0 && !isSpeakingRef.current && !isProcessingRef.current) {
-            processAudioChunk(false);
-          }
-        }, 15000); // Process every 15 seconds
-        
-        toast.success("Recording started - speak clearly into your microphone");
-      } catch (err) {
-        console.error("Failed to start recording:", err);
-        toast.error("Could not access microphone. Please check permissions.");
-      }
+      speechId = result.speechId;
     } catch (err) {
       toast.error("Failed to start speech");
+      return;
     }
-  }, [roomData?.room.id, currentSpeaker, createSpeech, processAudioChunk, speakAnnouncement]);
+
+    // Track the active speech for the timer + Scribe callbacks.
+    setCurrentSpeechId(speechId);
+    currentSpeechIdRef.current = speechId;
+    timeRemainingRef.current = currentSpeaker.time;
+
+    // Start the timer / give the speaker the floor immediately. Even if STT
+    // fails below, they keep the floor and can end the speech normally.
+    setIsTimerRunning(true);
+
+    // Announce first, THEN start capturing (so the moderator voice isn't
+    // transcribed as the speaker).
+    await speakAnnouncement("Your time begins now.");
+
+    // Exchange for a short-lived single-use Scribe token (server-side; the
+    // API key never reaches the browser).
+    let token: string;
+    let modelId: string;
+    try {
+      const minted = await createScribeToken.mutateAsync({
+        roomId: roomData.room.id,
+        speechId,
+      });
+      token = minted.token;
+      modelId = minted.modelId;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Could not start transcription";
+      setSttError(message);
+      toast.error(`Live transcription unavailable: ${message}`);
+      return; // Speaker still has the floor; no infinite spinner.
+    }
+
+    try {
+      await scribe.connect({ token, modelId });
+      toast.success("Recording started — speak clearly into your microphone");
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Could not connect to transcription / access microphone";
+      setSttError(message);
+      toast.error(message);
+    }
+  }, [roomData?.room.id, currentSpeaker, createSpeech, createScribeToken, scribe, speakAnnouncement]);
 
   const stopSpeech = useCallback(async () => {
-    console.log("[Recording] Stopping speech...");
-    console.log("[Recording] Total chunks collected:", audioChunksRef.current.length);
-    console.log("[Recording] Processed so far:", processedIndexRef.current);
-    
     // Stop timer
     setIsTimerRunning(false);
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
-    
-    // Clear transcription interval first
-    if (transcriptionIntervalRef.current) {
-      clearInterval(transcriptionIntervalRef.current);
-      transcriptionIntervalRef.current = null;
+
+    // Flush any buffered audio into a final committed segment, then tear down
+    // the mic + WebSocket.
+    if (scribe.isConnected) {
+      try {
+        scribe.commit();
+        // Give the final onCommittedTranscript a moment to fire + persist.
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      } catch {
+        // Non-fatal: we still disconnect and end the speech below.
+      }
+      scribe.disconnect();
     }
-    
-    // Stop recording and process ALL remaining audio
-    if (mediaRecorderRef.current && isRecording) {
-      // Request final data before stopping
-      if (mediaRecorderRef.current.state === 'recording') {
-        console.log("[Recording] Requesting final data...");
-        mediaRecorderRef.current.requestData(); // Force emit any pending data
-      }
-      
-      mediaRecorderRef.current.stop();
-      
-      // Wait for ondataavailable to fire with final chunk
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      console.log("[Recording] After stop - total chunks:", audioChunksRef.current.length);
-      
-      // Process ALL remaining unprocessed audio (force final processing)
-      const unprocessedCount = audioChunksRef.current.length - processedIndexRef.current;
-      if (unprocessedCount > 0) {
-        console.log("[Recording] Processing final", unprocessedCount, "unprocessed chunks");
-        // Wait for any in-progress transcription to complete
-        while (isProcessingRef.current) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-        await processAudioChunk(true); // Pass true for final processing
-      }
-      
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-      }
-      setIsRecording(false);
-      setIsMicActive(false);
-      mediaRecorderRef.current = null;
-    }
-    
+
     // End speech record using ref for accurate values
     const speechId = currentSpeechIdRef.current;
     if (speechId && currentSpeaker) {
       const duration = currentSpeaker.time - timeRemainingRef.current;
-      console.log("[Recording] Ending speech, duration:", duration, "seconds");
       await endSpeech.mutateAsync({
         speechId,
         duration,
       });
     }
-    
-    // Clear audio refs
-    audioChunksRef.current = [];
-    processedIndexRef.current = 0;
-    
+
+    // Pull any just-committed final segments into the shared transcript.
+    utils.transcript.poll.invalidate();
+
     speakAnnouncement("Thank you. Moving to the next speaker.");
-    
+
     // Advance to next speaker
     if (roomData?.room.id) {
       setTimeout(() => {
         advanceSpeaker.mutate({ roomId: roomData.room.id });
       }, 2000);
     }
-    
+
     // Clear refs
     setCurrentSpeechId(null);
     currentSpeechIdRef.current = null;
-  }, [currentSpeaker, roomData?.room.id, isRecording, endSpeech, advanceSpeaker, processAudioChunk, speakAnnouncement]);
+    setSttError(null);
+  }, [currentSpeaker, roomData?.room.id, endSpeech, advanceSpeaker, scribe, speakAnnouncement, utils]);
 
   const toggleMic = useCallback(() => {
-    if (streamRef.current) {
-      const audioTrack = streamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsMicActive(audioTrack.enabled);
-        toast.info(audioTrack.enabled ? "Microphone unmuted" : "Microphone muted");
-      }
+    if (!scribe.isConnected) return;
+    if (scribe.isMuted) {
+      scribe.unmute();
+      toast.info("Microphone unmuted");
+    } else {
+      scribe.mute();
+      toast.info("Microphone muted");
     }
-  }, []);
+  }, [scribe]);
 
   const handlePOI = () => {
     if (!roomData?.room.id || !currentSpeechId) return;
-    
+
     offerPOI.mutate({
       roomId: roomData.room.id,
       speechId: currentSpeechId,
@@ -641,6 +512,12 @@ export default function Debate() {
   const isWarning = timeRemaining <= 60 && timeRemaining > 30;
   const isDanger = timeRemaining <= 30;
 
+  // Scribe-derived UI state.
+  const isConnected = scribe.isConnected;
+  const isMicActive = isConnected && !scribe.isMuted;
+  const isTranscribing = scribe.isTranscribing;
+  const isConnecting = scribe.status === "connecting";
+
   return (
     <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
@@ -658,7 +535,7 @@ export default function Debate() {
               </Badge>
             )}
           </div>
-          <Badge 
+          <Badge
             variant={currentSpeaker?.team === "government" ? "default" : "destructive"}
             className="text-sm"
           >
@@ -701,7 +578,7 @@ export default function Debate() {
                     {formatTime(timeRemaining)}
                   </div>
                   <Progress value={progress} className="mt-4 h-2" />
-                  
+
                   {/* Timer status */}
                   <div className="mt-2 flex items-center justify-center gap-2 text-sm">
                     {isTimerRunning ? (
@@ -713,7 +590,7 @@ export default function Debate() {
                         <Pause className="w-3 h-3" /> Paused
                       </Badge>
                     )}
-                    {isRecording && (
+                    {isConnected && (
                       <Badge variant="destructive" className="gap-1">
                         <Mic className="w-3 h-3 animate-pulse" /> Recording
                       </Badge>
@@ -750,18 +627,29 @@ export default function Debate() {
                   </div>
                 </div>
 
+                {/* Live transcription error (never silently swallowed) */}
+                {sttError && (
+                  <div className="flex items-start justify-center gap-2 mt-4 text-red-500">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span className="text-sm">
+                      Live transcription issue: {sttError}. You can keep
+                      speaking and end your speech normally.
+                    </span>
+                  </div>
+                )}
+
                 {/* Controls */}
                 <div className="flex justify-center gap-4 mt-6">
                   {isMyTurn ? (
                     <>
                       {!isTimerRunning ? (
-                        <Button 
-                          size="lg" 
-                          onClick={startSpeech} 
+                        <Button
+                          size="lg"
+                          onClick={startSpeech}
                           className="gap-2"
-                          disabled={createSpeech.isPending}
+                          disabled={createSpeech.isPending || createScribeToken.isPending || isConnecting}
                         >
-                          {createSpeech.isPending ? (
+                          {(createSpeech.isPending || createScribeToken.isPending || isConnecting) ? (
                             <Loader2 className="w-5 h-5 animate-spin" />
                           ) : (
                             <Mic className="w-5 h-5" />
@@ -770,11 +658,12 @@ export default function Debate() {
                         </Button>
                       ) : (
                         <>
-                          <Button 
-                            size="lg" 
+                          <Button
+                            size="lg"
                             variant={isMicActive ? "default" : "outline"}
                             onClick={toggleMic}
                             className="gap-2"
+                            disabled={!isConnected}
                           >
                             {isMicActive ? (
                               <Mic className="w-5 h-5" />
@@ -783,8 +672,8 @@ export default function Debate() {
                             )}
                             {isMicActive ? "Mute" : "Unmute"}
                           </Button>
-                          <Button 
-                            size="lg" 
+                          <Button
+                            size="lg"
                             variant="destructive"
                             onClick={stopSpeech}
                             className="gap-2"
@@ -803,8 +692,8 @@ export default function Debate() {
                   ) : (
                     <>
                       {canOfferPOI && (
-                        <Button 
-                          size="lg" 
+                        <Button
+                          size="lg"
                           variant="outline"
                           onClick={handlePOI}
                           className="gap-2"
@@ -831,7 +720,7 @@ export default function Debate() {
               </CardContent>
             </Card>
 
-            {/* Live Transcript - Now synced from server */}
+            {/* Live Transcript - synced from server, with live partial for the speaker */}
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
@@ -844,7 +733,7 @@ export default function Debate() {
               </CardHeader>
               <CardContent>
                 <ScrollArea className="h-48">
-                  {liveTranscript.length > 0 ? (
+                  {liveTranscript.length > 0 || (isMyTurn && scribe.partialTranscript) ? (
                     <div className="space-y-3">
                       {liveTranscript.map((entry) => (
                         <div key={entry.id} className="border-l-2 border-primary pl-3">
@@ -856,10 +745,22 @@ export default function Debate() {
                           <p className="text-sm">{entry.text}</p>
                         </div>
                       ))}
+                      {isMyTurn && scribe.partialTranscript && (
+                        <div className="border-l-2 border-muted-foreground/40 pl-3">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
+                            <span className="font-medium">{currentSpeaker?.label}</span>
+                            <span>•</span>
+                            <span className="italic">speaking…</span>
+                          </div>
+                          <p className="text-sm text-muted-foreground italic">
+                            {scribe.partialTranscript}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <p className="text-sm text-muted-foreground text-center py-8">
-                      {isRecording 
+                      {isConnected
                         ? "Listening... Transcript will appear here as you speak."
                         : "Transcript will appear here during speeches..."}
                     </p>
@@ -886,7 +787,7 @@ export default function Debate() {
                   const isCurrent = fullIndex === currentSpeakerIndex;
                   const currentActiveIndex = activeSpeakingOrder.findIndex(s => s.role === currentSpeaker?.role);
                   const isPast = activeIndex < currentActiveIndex;
-                  
+
                   return (
                     <div
                       key={speaker.role}
